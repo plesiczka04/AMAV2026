@@ -16,8 +16,9 @@
  * The color filter settings are set using the cv_detect_color_object. This module can run multiple filters simultaneously
  * so you have to define which filter to use with the ORANGE_AVOIDER_VISUAL_DETECTION_ID setting.
  */
-
+#include <math.h> //Nikolas
 #include "modules/orange_avoider/orange_avoider.h"
+#include "modules/cnn_avoider/cnn_avoider.h"
 #include "firmwares/rotorcraft/navigation.h"
 #include "generated/airframe.h"
 #include "state.h"
@@ -36,211 +37,378 @@
 #define VERBOSE_PRINT(...)
 #endif
 
-static uint8_t moveWaypointForward(uint8_t waypoint, float distanceMeters);
-static uint8_t calculateForwards(struct EnuCoor_i *new_coor, float distanceMeters);
-static uint8_t moveWaypoint(uint8_t waypoint, struct EnuCoor_i *new_coor);
-static uint8_t increase_nav_heading(float incrementDegrees);
-static uint8_t chooseRandomIncrementAvoidance(void);
+
+
+
+//Computervision outputs
+
+extern float cnn_hx;
+extern float cnn_hy;
+
+
+
+// Used for low pass filter. Code that remembers the last 3 commands
+typedef enum {CMD_FWD, CMD_LEFT, CMD_RIGHT} cmd_t;
+
+static cmd_t hist[3];//Makes array that stores the last 3 commands.
+static int h_i = 0;
+static int h_n = 0;
+
+static FILE *log_file= NULL; // To save log_file  (STEP1)
+static cmd_t majority(cmd_t new_cmd)
+{
+    hist[h_i] = new_cmd;
+    h_i = (h_i + 1) % 3;// allows to overwrite commands (so taht we have continuous real time loop)
+    if (h_n < 3) h_n++;
+
+    int f=0,l=0,r=0;
+    for(int i=0;i<h_n;i++){
+        if(hist[i]==CMD_FWD) f++;
+        else if(hist[i]==CMD_LEFT) l++;
+        else r++;
+    }
+
+    if (f>=l && f>=r) return CMD_FWD;
+    if (l>=f && l>=r) return CMD_LEFT;
+    return CMD_RIGHT;
+}
+
 
 enum navigation_state_t {
-  SAFE,
-  OBSTACLE_FOUND,
-  SEARCH_FOR_SAFE_HEADING,
-  OUT_OF_BOUNDS
+  Forward,
+  Diagonal_left,
+  Diagonal_right,
+  LANDING
 };
 
-// define settings
-float oa_color_count_frac = 0.18f;
 
+
+// define settings, float => stores numbers with DECIMALS.    int => stores numbers only without any decimal!
+float oa_color_count_frac = 0.18f;// This means 18% of  color means it is obstacle
+
+
+//////////////////SEARCH_FOR_SAFE_HEADING//////////////////////
 // define and initialise global variables
-enum navigation_state_t navigation_state = SEARCH_FOR_SAFE_HEADING;
+enum navigation_state_t navigation_state = Forward;// This is where the drone starts from from all cases! IN FUTURE MAKE IT START AT ATAKEOFF
+
+
+
+//enum navigation_state_t navigation_state = SEARCH_FOR_SAFE_HEADING; // navigation_state is the variable in the category navigation_state_t
 int32_t color_count = 0;                // orange color count from color filter for obstacle detection
 int16_t obstacle_free_confidence = 0;   // a measure of how certain we are that the way ahead is safe.
 float heading_increment = 5.f;          // heading angle increment [deg]
 float maxDistance = 2.25;               // max waypoint displacement [m]
+//int16_t stores 16 bits, => 32,767.. 
+//int32_t stores 32 bits, => 32,767,574,853..   (much larger range)
 
 const int16_t max_trajectory_confidence = 5; // number of consecutive negative object detections to be sure we are obstacle free
+// const means constant, CANT CHANGE!
 
-/*
- * This next section defines an ABI messaging event (http://wiki.paparazziuav.org/wiki/ABI), necessary
- * any time data calculated in another module needs to be accessed. Including the file where this external
- * data is defined is not enough, since modules are executed parallel to each other, at different frequencies,
- * in different threads. The ABI event is triggered every time new data is sent out, and as such the function
- * defined in this file does not need to be explicitly called, only bound in the init function
- */
-#ifndef ORANGE_AVOIDER_VISUAL_DETECTION_ID
-#define ORANGE_AVOIDER_VISUAL_DETECTION_ID ABI_BROADCAST
-#endif
-static abi_event color_detection_ev;
-static void color_detection_cb(uint8_t __attribute__((unused)) sender_id,
-                               int16_t __attribute__((unused)) pixel_x, int16_t __attribute__((unused)) pixel_y,
-                               int16_t __attribute__((unused)) pixel_width, int16_t __attribute__((unused)) pixel_height,
-                               int32_t quality, int16_t __attribute__((unused)) extra)
+ 
+ 
+ static bool goal_outside_OZ(float goal_x, float goal_y)
 {
-  color_count = quality;
+  return !InsideObstacleZone(goal_x, goal_y);  // returns true if point inside OZ polygon or false if outside polygon
 }
-
-/*
- * Initialisation function, setting the colour filter, random seed and heading_increment
+ 
+ /*
+ 
+ NIKOLAS
  */
-void orange_avoider_init(void)
-{
-  // Initialise random values
-  srand(time(NULL));
-  chooseRandomIncrementAvoidance();
-
-  // bind our colorfilter callbacks to receive the color filter outputs
-  AbiBindMsgVISUAL_DETECTION(ORANGE_AVOIDER_VISUAL_DETECTION_ID, &color_detection_ev, color_detection_cb);
-}
-
-/*
- * Function that checks it is safe to move forwards, and then moves a waypoint forward or changes the heading
- */
+ 
 void orange_avoider_periodic(void)
 {
-  // only evaluate our state machine if we are flying
-  if(!autopilot_in_flight()){
+  if (!autopilot_in_flight()) {
     return;
   }
 
-  // compute current color thresholds
-  int32_t color_count_threshold = oa_color_count_frac * front_camera.output_size.w * front_camera.output_size.h;
+//SSOOOOOOOOOOOOSSSSS NIKOLAS PUT BACK!!!! /////////////////////////////
+  //float current_x = stateGetPositionEnu_f()->x;
+ // float current_y = stateGetPositionEnu_f()->y;
+ // float heading   = stateGetNedToBodyEulers_f()->psi;
+  
+float current_x = 0.0f;
+float current_y = 0.0f;
+float heading   = 0.0f;
 
-  VERBOSE_PRINT("Color_count: %d  threshold: %d state: %d \n", color_count, color_count_threshold, navigation_state);
+  float step = 0.05f;
+  float THRESH = -500.0f;     // sensor deadband
+  static int rotate_lock = 0;
+   float hx = cnn_hx;
+    float hy = cnn_hy;
 
-  // update our safe confidence using color threshold
-  if(color_count < color_count_threshold){
-    obstacle_free_confidence++;
-  } else {
-    obstacle_free_confidence -= 2;  // be more cautious with positive obstacle detections
+    float angle = DegOfRad(atan2f(hy, hx));
+
+  switch (navigation_state) {
+
+  /* ===================== FORWARD ===================== */
+
+  case Forward: {
+
+    static bool goal_set = false;
+    static float goal_x;
+    static float goal_y;
+
+    if (!goal_set) {
+      goal_x = current_x + step * sinf(heading);
+      goal_y = current_y + step * cosf(heading);
+      goal_set = true;
+    }
+    
+   if (goal_outside_OZ(goal_x, goal_y)) {
+    fprintf(stderr,"OZ BORDER → SMART 90 TURN\n");
+    goal_set = false;
+   float center_x = WaypointX(WP_HOME);
+    float center_y = WaypointY(WP_HOME);
+    float dx = center_x - current_x;
+    float dy = center_y - current_y;
+    /* heading toward center */
+    float heading_to_center = atan2f(dx, dy);
+    float err = heading_to_center - heading;
+    FLOAT_ANGLE_NORMALIZE(err);
+    if (err > 0)
+        navigation_state = Diagonal_right;   // turning right moves heading CCW in ENU
+    else
+        navigation_state = Diagonal_left;
+    rotate_lock = 20;   // give enough time for ~90° turn
+    break;
+}
+
+
+
+
+    waypoint_set_xy_i(WP_GOAL,
+        POS_BFP_OF_REAL(goal_x),
+        POS_BFP_OF_REAL(goal_y));
+
+    float dx = goal_x - current_x;
+    float dy = goal_y - current_y;
+    float dist = sqrtf(dx*dx + dy*dy);
+    
+
+fprintf(stderr,"CNN angle=%.2f deg\n",angle);
+    
+    if (log_file) {
+    fprintf(log_file,
+        "%f,%f,%f,%f,%f,%f\n",
+        current_x,
+        current_y,
+        DegOfRad(heading),
+        goal_x,
+        goal_y,
+        angle);
+    fflush(log_file);
+}
+
+    
+    /////////////////////////////////////////////////////////////////////////////////
+
+
+
+
+   if (rotate_lock == 0)
+{
+    cmd_t c;
+
+    if   (angle > 25 ||    // If positive angle NIKOLAS CHANGE!
+          angle < -25 )  // If positive angle NIKOLAS CHANGE!
+           {
+          goal_set = false;
+
+        if (angle > 0) c = CMD_RIGHT; // If positive angle NIKOLAS CHANGE!
+        else c = CMD_LEFT;
+                      }
+    else
+        c = CMD_FWD;
+
+     c = majority(c);
+     
+     if (h_n < 3) { // This code case to break (exit)  if 3 new commands are not entered (left,right,forward
+    break;
+}
+
+
+
+   if (c == CMD_FWD)   fprintf(stderr,"CMD = FORWARD\n"); //This is just to print to my screen the results from my low pass
+   if (c == CMD_LEFT)  fprintf(stderr,"CMD = LEFT\n");
+   if (c == CMD_RIGHT) fprintf(stderr,"CMD = RIGHT\n");
+
+    if (c == CMD_LEFT){
+           navigation_state = Diagonal_left;
+           
+           hist[0] = hist[1] = hist[2] = CMD_FWD;// Here I reset my low pass filter
+           h_n = 0;
+           
+           rotate_lock = 1;
+          break;
+             }
+    else if (c == CMD_RIGHT){
+          navigation_state = Diagonal_right;
+          
+          hist[0] = hist[1] = hist[2] = CMD_FWD; // Here I reset my low pass filter
+           h_n = 0;
+           
+          rotate_lock = 1;
+           break;
+             }
+}
+
+
+    /* waypoint reached → generate next step */
+    if (dist < 0.2f) {
+        goal_set = false;
+        break;
+    }
+
+    break;
   }
 
-  // bound obstacle_free_confidence
-  Bound(obstacle_free_confidence, 0, max_trajectory_confidence);
+  /* ================= ROTATE LEFT ================= */
 
-  float moveDistance = fminf(maxDistance, 0.2f * obstacle_free_confidence);
+  case Diagonal_left: {
 
-  switch (navigation_state){
-    case SAFE:
-      // Move waypoint forward
-      moveWaypointForward(WP_TRAJECTORY, 1.5f * moveDistance);
-      if (!InsideObstacleZone(WaypointX(WP_TRAJECTORY),WaypointY(WP_TRAJECTORY))){
-        navigation_state = OUT_OF_BOUNDS;
-      } else if (obstacle_free_confidence == 0){
-        navigation_state = OBSTACLE_FOUND;
-      } else {
-        moveWaypointForward(WP_GOAL, moveDistance);
-      }
+fprintf(stderr,"CNN angle=%.2f deg\n", angle);
 
-      break;
-    case OBSTACLE_FOUND:
-      // stop
-      waypoint_move_here_2d(WP_GOAL);
-      waypoint_move_here_2d(WP_TRAJECTORY);
+    waypoint_set_xy_i(WP_GOAL,
+        POS_BFP_OF_REAL(current_x),
+        POS_BFP_OF_REAL(current_y));
 
-      // randomly select new search direction
-      chooseRandomIncrementAvoidance();
+    float desired_heading = heading - RadOfDeg(9.0f);
+    nav_set_heading_rad(desired_heading);
+    
+     if (log_file) {
+    fprintf(log_file,
+        "%f,%f,%f,%f,%f,%f\n",
+        current_x,
+        current_y,
+        DegOfRad(heading),
+        NAN,
+        NAN,
+        angle
+        );
+    fflush(log_file);
+}
 
-      navigation_state = SEARCH_FOR_SAFE_HEADING;
 
-      break;
-    case SEARCH_FOR_SAFE_HEADING:
-      increase_nav_heading(heading_increment);
+    if (rotate_lock > 0)
+        rotate_lock--;
 
-      // make sure we have a couple of good readings before declaring the way safe
-      if (obstacle_free_confidence >= 2){
-        navigation_state = SAFE;
-      }
-      break;
-    case OUT_OF_BOUNDS:
-      increase_nav_heading(heading_increment);
-      moveWaypointForward(WP_TRAJECTORY, 1.5f);
+    if (rotate_lock == 0 &&
+        angle < 20 ||
+        angle > -20 )
+    {
+        navigation_state = Forward;
+    }
+    
+    
+    cmd_t c = majority(CMD_LEFT); // Here I just print my commands
+if (c == CMD_FWD)   fprintf(stderr,"CMD = FORWARD\n");
+if (c == CMD_LEFT)  fprintf(stderr,"CMD = LEFT\n");
+if (c == CMD_RIGHT) fprintf(stderr,"CMD = RIGHT\n");
 
-      if (InsideObstacleZone(WaypointX(WP_TRAJECTORY),WaypointY(WP_TRAJECTORY))){
-        // add offset to head back into arena
-        increase_nav_heading(heading_increment);
-
-        // reset safe counter
-        obstacle_free_confidence = 0;
-
-        // ensure direction is safe before continuing
-        navigation_state = SEARCH_FOR_SAFE_HEADING;
-      }
-      break;
-    default:
-      break;
+    break;
   }
-  return;
+
+  /* ================= ROTATE RIGHT ================= */
+
+  case Diagonal_right: {
+
+ fprintf(stderr,"CNN angle=%.2f deg\n", angle);
+
+    waypoint_set_xy_i(WP_GOAL,
+        POS_BFP_OF_REAL(current_x),
+        POS_BFP_OF_REAL(current_y));
+
+    float desired_heading = heading + RadOfDeg(9.0f);
+    nav_set_heading_rad(desired_heading);
+    
+     if (log_file) {
+    fprintf(log_file,
+        "%f,%f,%f,%f,%f,%f\n",
+        current_x,
+        current_y,
+        DegOfRad(heading),
+        NAN,
+        NAN,
+        angle);
+    fflush(log_file);
 }
 
-/*
- * Increases the NAV heading. Assumes heading is an INT32_ANGLE. It is bound in this function.
- */
-uint8_t increase_nav_heading(float incrementDegrees)
-{
-  float new_heading = stateGetNedToBodyEulers_f()->psi + RadOfDeg(incrementDegrees);
+    if (rotate_lock > 0)
+        rotate_lock--;
 
-  // normalize heading to [-pi, pi]
-  FLOAT_ANGLE_NORMALIZE(new_heading);
+        if (rotate_lock == 0 &&
+        angle < 20 ||
+        angle > -20 )
+    {
+        navigation_state = Forward;
+    }
+    
+        cmd_t c = majority(CMD_RIGHT); // Here I just print my commands
+if (c == CMD_FWD)   fprintf(stderr,"CMD = FORWARD\n");
+if (c == CMD_LEFT)  fprintf(stderr,"CMD = LEFT\n");
+if (c == CMD_RIGHT) fprintf(stderr,"CMD = RIGHT\n");
 
-  // set heading, declared in firmwares/rotorcraft/navigation.h
-  nav.heading = new_heading;
-
-  VERBOSE_PRINT("Increasing heading to %f\n", DegOfRad(new_heading));
-  return false;
-}
-
-/*
- * Calculates coordinates of distance forward and sets waypoint 'waypoint' to those coordinates
- */
-uint8_t moveWaypointForward(uint8_t waypoint, float distanceMeters)
-{
-  struct EnuCoor_i new_coor;
-  calculateForwards(&new_coor, distanceMeters);
-  moveWaypoint(waypoint, &new_coor);
-  return false;
-}
-
-/*
- * Calculates coordinates of a distance of 'distanceMeters' forward w.r.t. current position and heading
- */
-uint8_t calculateForwards(struct EnuCoor_i *new_coor, float distanceMeters)
-{
-  float heading  = stateGetNedToBodyEulers_f()->psi;
-
-  // Now determine where to place the waypoint you want to go to
-  new_coor->x = stateGetPositionEnu_i()->x + POS_BFP_OF_REAL(sinf(heading) * (distanceMeters));
-  new_coor->y = stateGetPositionEnu_i()->y + POS_BFP_OF_REAL(cosf(heading) * (distanceMeters));
-  VERBOSE_PRINT("Calculated %f m forward position. x: %f  y: %f based on pos(%f, %f) and heading(%f)\n", distanceMeters,	
-                POS_FLOAT_OF_BFP(new_coor->x), POS_FLOAT_OF_BFP(new_coor->y),
-                stateGetPositionEnu_f()->x, stateGetPositionEnu_f()->y, DegOfRad(heading));
-  return false;
-}
-
-/*
- * Sets waypoint 'waypoint' to the coordinates of 'new_coor'
- */
-uint8_t moveWaypoint(uint8_t waypoint, struct EnuCoor_i *new_coor)
-{
-  VERBOSE_PRINT("Moving waypoint %d to x:%f y:%f\n", waypoint, POS_FLOAT_OF_BFP(new_coor->x),
-                POS_FLOAT_OF_BFP(new_coor->y));
-  waypoint_move_xy_i(waypoint, new_coor->x, new_coor->y);
-  return false;
-}
-
-/*
- * Sets the variable 'heading_increment' randomly positive/negative
- */
-uint8_t chooseRandomIncrementAvoidance(void)
-{
-  // Randomly choose CW or CCW avoiding direction
-  if (rand() % 2 == 0) {
-    heading_increment = 5.f;
-    VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
-  } else {
-    heading_increment = -5.f;
-    VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
+    break;
   }
-  return false;
+
+  case LANDING: {
+    autopilot_set_mode(AP_MODE_KILL);
+    GotoBlock(10);
+    break;
+  }
+
+  }
 }
+
+
+
+void orange_avoider_init(void)
+{
+    fprintf(stderr,"orange avoider init\n");
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

@@ -1,0 +1,3 @@
+conf saved to /home/nikolas/paparazzi/conf/userconf/tudelft/course_conf.xml
+conf restored.
+conf saved to /home/nikolas/paparazzi/conf/userconf/tudelft/course_conf.xml

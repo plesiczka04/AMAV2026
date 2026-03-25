@@ -1,0 +1,20 @@
+<!DOCTYPE module SYSTEM "module.dtd">
+<module name="cnn_avoider" dir="cnn_avoider">
+  <doc>
+    <description>
+      CNN-based obstacle avoidance using a 4-layer convolutional neural network.
+    </description>
+  </doc>
+
+  <header>
+    <file name="cnn_avoider.h"/>
+  </header>
+
+  <init fun="cnn_avoider_init()"/>
+  <periodic fun="cnn_avoider_periodic()" freq="10." autorun="TRUE"/>
+
+  <makefile target="ap|nps">
+    <file name="cnn_avoider.c"/>
+    <define name="CNN_AVOIDER_FPS" value="10"/>
+  </makefile>
+</module>

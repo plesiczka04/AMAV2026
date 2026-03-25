@@ -25,252 +25,369 @@
  * if you are over the defined object or not
  */
 
-// Own header
-#include "modules/computer_vision/cv_detect_color_object.h"
-#include "modules/computer_vision/cv.h"
-#include "modules/core/abi.h"
-#include "std.h"
 
-#include <stdio.h>
-#include <stdbool.h>
+///////////////////// Nikolas start ////////////////////
+//SO BASICLY TO SCALE IT DOWN FOR COMPUTATION, SEE BLACK PIXELS IN FEED REAL TIME. BUT PAPARAZZI FOR COMPUTATION SKIPS MANY PIXELS TO MATCH SCALING
 #include <math.h>
-#include "pthread.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include "modules/computer_vision/cv.h"
 
-#define PRINT(string,...) fprintf(stderr, "[object_detector->%s()] " string,__FUNCTION__ , ##__VA_ARGS__)
-#if OBJECT_DETECTOR_VERBOSE
-#define VERBOSE_PRINT PRINT
-#else
-#define VERBOSE_PRINT(...)
-#endif
 
-static pthread_mutex_t mutex;
+float sum_left= 0.0f;
+float sum_middle= 0.0f;
+float sum_right = 0.0f;
 
-#ifndef COLOR_OBJECT_DETECTOR_FPS1
-#define COLOR_OBJECT_DETECTOR_FPS1 0 ///< Default FPS (zero means run at camera fps)
-#endif
-#ifndef COLOR_OBJECT_DETECTOR_FPS2
-#define COLOR_OBJECT_DETECTOR_FPS2 0 ///< Default FPS (zero means run at camera fps)
-#endif
 
-// Filter Settings
-uint8_t cod_lum_min1 = 0;
-uint8_t cod_lum_max1 = 0;
-uint8_t cod_cb_min1 = 0;
-uint8_t cod_cb_max1 = 0;
-uint8_t cod_cr_min1 = 0;
-uint8_t cod_cr_max1 = 0;
 
-uint8_t cod_lum_min2 = 0;
-uint8_t cod_lum_max2 = 0;
-uint8_t cod_cb_min2 = 0;
-uint8_t cod_cb_max2 = 0;
-uint8_t cod_cr_min2 = 0;
-uint8_t cod_cr_max2 = 0;
+int cod_lum_min1 = 0;
+int cod_lum_max1 = 255;
+int cod_cb_min1 = 0;
+int cod_cb_max1 = 255;
+int cod_cr_min1 = 0;
+int cod_cr_max1 = 255;
+int cod_draw1 = 0;
 
-bool cod_draw1 = false;
-bool cod_draw2 = false;
+int cod_lum_min2 = 0;
+int cod_lum_max2 = 255;
+int cod_cb_min2 = 0;
+int cod_cb_max2 = 255;
+int cod_cr_min2 = 0;
+int cod_cr_max2 = 255;
+int cod_draw2 = 0;
 
-// define global variables
-struct color_object_t {
-  int32_t x_c;
-  int32_t y_c;
-  uint32_t color_count;
-  bool updated;
-};
-struct color_object_t global_filters[2];
 
-// Function
-uint32_t find_object_centroid(struct image_t *img, int32_t* p_xc, int32_t* p_yc, bool draw,
-                              uint8_t lum_min, uint8_t lum_max,
-                              uint8_t cb_min, uint8_t cb_max,
-                              uint8_t cr_min, uint8_t cr_max);
 
-/*
- * object_detector
- * @param img - input image to process
- * @param filter - which detection filter to process
- * @return img
- */
-static struct image_t *object_detector(struct image_t *img, uint8_t filter)
+static uint8_t *prev_frame = NULL;
+static bool waiting_second = false;
+static int frame_size = 0;
+
+
+#define STEP 20   // distance between sampled pixels  THIS IS SCALING
+#define DS_W 12   // sampled width
+#define DS_H 26   // sampled height
+
+int flow_dx[DS_H][DS_W];
+int flow_dy[DS_H][DS_W];
+
+void detect_surface_obstacles(uint8_t *f1, uint8_t *f2, int w, int h);//NIKOLAS calls detect_surface_obstacles
+void color_object_detector_init(void);
+void color_object_detector_periodic(void);
+
+
+static uint8_t small_frame1[DS_W * DS_H];//Frame 1
+static uint8_t small_frame2[DS_W * DS_H]; //Frame 2
+// TO be used for the rescaling
+
+//Each time the camera captures a frame, Paparazzi calls: my_cv(img, camera_id);
+struct image_t *cv_detect_color_object(struct image_t *img, uint8_t __attribute__((unused)) camera_id) //img is a pointer to the image stored somewhere in memory. 
+                                                               //I use pointer bcz image is large hence instaead of copying it, paparazzi gives an adress to is
 {
-  uint8_t lum_min, lum_max;
-  uint8_t cb_min, cb_max;
-  uint8_t cr_min, cr_max;
-  bool draw;
+    // fprintf(stderr,"NIKOLASSS RUNNING\n");// To check if this file is running
+  uint8_t *buffer = img->buf; // this is memeory location where the pixels are stored
+  uint8_t *buf = (uint8_t *)img->buf;
+  
+  
+  
+ // fprintf(stderr,"img->w=%d img->h=%d samples_x=%d samples_y=%d\n",
+ // img->w, img->h,
+  //img->w / STEP,
+  //img->h / STEP);
+        
+        
+// Here we loop through every pixel in the image.
+//Paparazzi uses 2 bytes per pixel (RGB uses 3 bytes per pixel). Format 2 pixels: U Y1 V Y2:
+                                                                                             //where U is color info shared between two pixels
+                                                                                             //where Y1  is pixel 1 brightness
+                                                                                             //where V is color info shared between the two pixels
+                                                                                             //where Y2 is pixel 2 brightness
+                                                                                        //=> hence pixel 1=(Y1,U,V) , pixel 2=(Y2,U,V)
+                                                                                        
+ // I store the first frame of the camera:
+if (!waiting_second) {//f we are waiting for the first frame of a pair. If false -> we don't have frame1 yet  / if True ->  we already stored frame1 and are waiting for frame2
+  frame_size = img->w * img->h * 2; // Frame size
+  if (prev_frame == NULL)//If memory for the previous frame has not been allocated yet.
+    prev_frame = malloc(frame_size); // then we allocate... lol. Create memory (malloc) to store the previous image. prev_frame is the pointer to that memory and frame_size is how much memory we need
+  memcpy(prev_frame, buffer, frame_size);//copy the current image into prev_frame
+  
+  
 
-  switch (filter){
-    case 1:
-      lum_min = cod_lum_min1;
-      lum_max = cod_lum_max1;
-      cb_min = cod_cb_min1;
-      cb_max = cod_cb_max1;
-      cr_min = cod_cr_min1;
-      cr_max = cod_cr_max1;
-      draw = cod_draw1;
-      break;
-    case 2:
-      lum_min = cod_lum_min2;
-      lum_max = cod_lum_max2;
-      cb_min = cod_cb_min2;
-      cb_max = cod_cb_max2;
-      cr_min = cod_cr_min2;
-      cr_max = cod_cr_max2;
-      draw = cod_draw2;
-      break;
-    default:
-      return img;
-  };
+  waiting_second = true;   // next frame will be frame2
+  return img;//Give the image back to Paparazzi.
+}                                                                                    
+                                                                                        
+                                                                                        
+/* we now have frame1 + frame2 */
 
-  int32_t x_c, y_c;
+uint8_t *frame1 = prev_frame;
+uint8_t *frame2 = buffer;
 
-  // Filter and find centroid
-  uint32_t count = find_object_centroid(img, &x_c, &y_c, draw, lum_min, lum_max, cb_min, cb_max, cr_min, cr_max);
-  VERBOSE_PRINT("Color count %d: %u, threshold %u, x_c %d, y_c %d\n", camera, object_count, count_threshold, x_c, y_c);
-  VERBOSE_PRINT("centroid %d: (%d, %d) r: %4.2f a: %4.2f\n", camera, x_c, y_c,
-        hypotf(x_c, y_c) / hypotf(img->w * 0.5, img->h * 0.5), RadOfDeg(atan2f(y_c, x_c)));
 
-  pthread_mutex_lock(&mutex);
-  global_filters[filter-1].color_count = count;
-  global_filters[filter-1].x_c = x_c;
-  global_filters[filter-1].y_c = y_c;
-  global_filters[filter-1].updated = true;
-  pthread_mutex_unlock(&mutex);
+/* optical flow calculation using frame1 and frame2 */  
+int idx = 0;
+static int frame_pairs_printed = 0;
 
+for (int x = img->w - STEP; x >= 0; x -= STEP) {    // columns left to right
+ for (int y = 0; y < img->h; y += STEP){  // rows bottom to top  
+    //Declare a pointer to one pixel value.It is basicly a pointer to where that pixel is stored in memory
+    
+//Right below: buffer→raw image memory,then we go look deeper to the correct row(each row occupies 2 bytes*width)(y* 2* img->w)then move to thecorrect col(2*x)    
+ // and then select the Y brightness value inside UYVY (+1) . and finally yp=&..it finds the memory adress of the brightness Y pixel at position (x,y)    
+
+   
+   int base = y * 2 * img->w + 2 * x;
+//SOS FOR OVERLEAF REPORT! I  read U1,Y1,V1 and I combine that into using formula Y1 + 0.25*(U1-128) + 0.25*(V1-128);  to get grayscale!
+//uint8_t U1 = frame1[base + 0];
+uint8_t Y1 = frame1[base + 1];
+//uint8_t V1 = frame1[base + 2];
+
+//uint8_t U2 = frame2[base + 0];
+uint8_t Y2 = frame2[base + 1];
+//uint8_t V2 = frame2[base + 2];
+
+//int gray1 = Y1 + 0.5*(U1-128) + 0.5*(V1-128);
+//int gray2 = Y2 + 0.5*(U2-128) + 0.5*(V2-128);
+
+//if (gray1 < 0) gray1 = 0;
+//if (gray1 > 255) gray1 = 255;
+//if (gray2 < 0) gray2 = 0;
+//if (gray2 > 255) gray2 = 255;
+
+small_frame1[idx] = Y1; // Stores the brightness of the pixel of the downsampled frame 1
+small_frame2[idx] = Y2; // Stores the brightness of the pixel of the downsampled frame 2
+    
+    int sx = x / STEP; //indexes from 11 to 0 rows(hight)
+    int sy = y / STEP; //indexes from 0 to 25 colls(width)
+    //SOS IMAGE IS PRINT LIEK TRAIN DATA IMAGES INVERTED 90 degrees)  NOW BELOW I PRINT IT TRNASFORMED TO CORRECT FORM (REAL DIRECTION)
+    
+    if (frame_pairs_printed < 1) {
+     fprintf(stderr,"(%d,%d)=%3d ", sx, sy, small_frame1[idx]); // Prints all colors(all colls)  (from white to black 0 to 255)
+      }    
+        
+
+
+    idx++;
+  }
+  if (frame_pairs_printed < 1) {
+    fprintf(stderr,"\n"); // Prints all colors(all rows)  (from white to black 0 to 255)
+  }
+  
+}
+frame_pairs_printed++;
+//////////////////////////////////                                                           ///////////////////////////////// 
+//////////////////////////////////                                                           /////////////////////////////////  
+/////////////////////////////////    SOSSSSS    WE DRAW OPTICAL FLOW OF IMAGE HEREEEEEEEEEE  //////////////////////////////////
+/////////////////////////////////                call function here                          /////////////////////////////////  
+/////////////////////////////////                                                            /////////////////////////////////  
+         
+  detect_surface_obstacles(small_frame1, small_frame2, DS_W, DS_H);   
+  
+  
+    waiting_second = false;   // next frame becomes new frame1
+  
   return img;
 }
 
-struct image_t *object_detector1(struct image_t *img, uint8_t camera_id);
-struct image_t *object_detector1(struct image_t *img, uint8_t camera_id __attribute__((unused)))
-{
-  return object_detector(img, 1);
-}
 
-struct image_t *object_detector2(struct image_t *img, uint8_t camera_id);
-struct image_t *object_detector2(struct image_t *img, uint8_t camera_id __attribute__((unused)))
-{
-  return object_detector(img, 2);
-}
 
 void color_object_detector_init(void)
 {
-  memset(global_filters, 0, 2*sizeof(struct color_object_t));
-  pthread_mutex_init(&mutex, NULL);
-#ifdef COLOR_OBJECT_DETECTOR_CAMERA1
-#ifdef COLOR_OBJECT_DETECTOR_LUM_MIN1
-  cod_lum_min1 = COLOR_OBJECT_DETECTOR_LUM_MIN1;
-  cod_lum_max1 = COLOR_OBJECT_DETECTOR_LUM_MAX1;
-  cod_cb_min1 = COLOR_OBJECT_DETECTOR_CB_MIN1;
-  cod_cb_max1 = COLOR_OBJECT_DETECTOR_CB_MAX1;
-  cod_cr_min1 = COLOR_OBJECT_DETECTOR_CR_MIN1;
-  cod_cr_max1 = COLOR_OBJECT_DETECTOR_CR_MAX1;
-#endif
-#ifdef COLOR_OBJECT_DETECTOR_DRAW1
-  cod_draw1 = COLOR_OBJECT_DETECTOR_DRAW1;
-#endif
-
-  cv_add_to_device(&COLOR_OBJECT_DETECTOR_CAMERA1, object_detector1, COLOR_OBJECT_DETECTOR_FPS1, 0);
-#endif
-
-#ifdef COLOR_OBJECT_DETECTOR_CAMERA2
-#ifdef COLOR_OBJECT_DETECTOR_LUM_MIN2
-  cod_lum_min2 = COLOR_OBJECT_DETECTOR_LUM_MIN2;
-  cod_lum_max2 = COLOR_OBJECT_DETECTOR_LUM_MAX2;
-  cod_cb_min2 = COLOR_OBJECT_DETECTOR_CB_MIN2;
-  cod_cb_max2 = COLOR_OBJECT_DETECTOR_CB_MAX2;
-  cod_cr_min2 = COLOR_OBJECT_DETECTOR_CR_MIN2;
-  cod_cr_max2 = COLOR_OBJECT_DETECTOR_CR_MAX2;
-#endif
-#ifdef COLOR_OBJECT_DETECTOR_DRAW2
-  cod_draw2 = COLOR_OBJECT_DETECTOR_DRAW2;
-#endif
-
-  cv_add_to_device(&COLOR_OBJECT_DETECTOR_CAMERA2, object_detector2, COLOR_OBJECT_DETECTOR_FPS2, 1);
-#endif
+  cv_add_to_device(&COLOR_OBJECT_DETECTOR_CAMERA1,
+                   cv_detect_color_object,
+                   COLOR_OBJECT_DETECTOR_FPS1,
+                   0);
 }
 
-/*
- * find_object_centroid
- *
- * Finds the centroid of pixels in an image within filter bounds.
- * Also returns the amount of pixels that satisfy these filter bounds.
- *
- * @param img - input image to process formatted as YUV422.
- * @param p_xc - x coordinate of the centroid of color object
- * @param p_yc - y coordinate of the centroid of color object
- * @param lum_min - minimum y value for the filter in YCbCr colorspace
- * @param lum_max - maximum y value for the filter in YCbCr colorspace
- * @param cb_min - minimum cb value for the filter in YCbCr colorspace
- * @param cb_max - maximum cb value for the filter in YCbCr colorspace
- * @param cr_min - minimum cr value for the filter in YCbCr colorspace
- * @param cr_max - maximum cr value for the filter in YCbCr colorspace
- * @param draw - whether or not to draw on image
- * @return number of pixels of image within the filter bounds.
- */
-uint32_t find_object_centroid(struct image_t *img, int32_t* p_xc, int32_t* p_yc, bool draw,
-                              uint8_t lum_min, uint8_t lum_max,
-                              uint8_t cb_min, uint8_t cb_max,
-                              uint8_t cr_min, uint8_t cr_max)
-{
-  uint32_t cnt = 0;
-  uint32_t tot_x = 0;
-  uint32_t tot_y = 0;
-  uint8_t *buffer = img->buf;
 
-  // Go through all the pixels
-  for (uint16_t y = 0; y < img->h; y++) {
-    for (uint16_t x = 0; x < img->w; x ++) {
-      // Check if the color is inside the specified values
-      uint8_t *yp, *up, *vp;
-      if (x % 2 == 0) {
-        // Even x
-        up = &buffer[y * 2 * img->w + 2 * x];      // U
-        yp = &buffer[y * 2 * img->w + 2 * x + 1];  // Y1
-        vp = &buffer[y * 2 * img->w + 2 * x + 2];  // V
-        //yp = &buffer[y * 2 * img->w + 2 * x + 3]; // Y2
-      } else {
-        // Uneven x
-        up = &buffer[y * 2 * img->w + 2 * x - 2];  // U
-        //yp = &buffer[y * 2 * img->w + 2 * x - 1]; // Y1
-        vp = &buffer[y * 2 * img->w + 2 * x];      // V
-        yp = &buffer[y * 2 * img->w + 2 * x + 1];  // Y2
-      }
-      if ( (*yp >= lum_min) && (*yp <= lum_max) &&
-           (*up >= cb_min ) && (*up <= cb_max ) &&
-           (*vp >= cr_min ) && (*vp <= cr_max )) {
-        cnt ++;
-        tot_x += x;
-        tot_y += y;
-        if (draw){
-          *yp = 255;  // make pixel brighter in image
+void color_object_detector_periodic(void) {}
+
+
+
+
+// My image is stored to 1D.  2D to 1D conversion --->  :       index = row * width + column
+void detect_surface_obstacles(uint8_t *f1, uint8_t *f2, int w, int h)
+{
+
+
+   float Grad_tot_vertical[DS_H] = {0};
+    float Grad_tot_surface[DS_W] = {0};
+
+    
+    float Grad_tot_vertical_left[8] = {0};
+    float Grad_tot_vertical_middle[9] = {0};
+    float Grad_tot_vertical_right[9] = {0};
+
+    sum_left = 0;
+    sum_middle = 0;
+    sum_right = 0;
+  float  sum_surface = 0.0;
+    
+    const float THRESHOLD_ONE = 1.0f; // SOS ADJUST PARAMETER, SURFACE HORIZON DETECTOR!
+    
+// PRINT RAW IMAGE STORAGE
+  //  fprintf(stderr,"Raw 1D memory order:\n");
+  //  for (int i = 0; i < w*h; i++) {
+    //    fprintf(stderr,"%3d ", f1[i]);
+    //    if ((i+1) % w == 0) fprintf(stderr,"\n");
+    //}
+    //fprintf(stderr,"\n====================\n");
+            
+            
+  //  for (int sy= 0; sy < h; sy++)     
+    //    Grad_tot_vertical[sy] = 0; //Matlab: Grad_tot_vertical = zeros(1,cols)
+        
+    //    for (int sx = 0; sx < w; sx++)
+   // Grad_tot_surface[sx] = 0; //Matlab: Grad_tot_surface = zeros(1,rows)
+
+//fprintf(stderr,"///////////////////////////////////\n");
+
+
+
+
+/////////////////////////SURFACE REMOVAL//////////////////////////////////////////////
+
+for (int sx = 0; sx < w - 1; sx++) { //Matlab: Grad_tot_surface = zeros(1,rows)
+        float col_sum = 0.0f;
+
+        for (int sy = 0; sy < h - 1; sy++) { //Matlab: Grad_tot_vertical = zeros(1,cols)
+            int idx = sx * h + sy;
+            col_sum += f1[idx];
         }
-      }
+
+        Grad_tot_surface[sx] = col_sum; 
+        sum_surface += col_sum;
     }
-  }
-  if (cnt > 0) {
-    *p_xc = (int32_t)roundf(tot_x / ((float) cnt) - img->w * 0.5f);
-    *p_yc = (int32_t)roundf(img->h * 0.5f - tot_y / ((float) cnt));
-  } else {
-    *p_xc = 0;
-    *p_yc = 0;
-  }
-  return cnt;
+
+    float mean_surface = sum_surface / (w - 1);
+    float threshold_value = mean_surface * THRESHOLD_ONE;
+  
+    int limit_sx = w - 1;
+    
+   // for (int sx = 0; sx < w - 1; sx++) {
+    
+   //   fprintf(stderr,"%.2f //", Grad_tot_surface[sx]);
+   // fprintf(stderr,"\n///////////////////////////////////\n"); 
+   // }
+    
+    for (int sx = 6; sx < w - 1; sx++) {//I start from sx=2 to make sure I dont get any frame edges noise, otherwise it removes my CV completetly thinking top sky is surface
+    
+        if (Grad_tot_surface[sx] > threshold_value) {
+            limit_sx = sx;
+            //fprintf(stderr, "limit_sx = %d\n", limit_sx);
+            break;
+        }
+    }
+    
+    
+ 
+     ////////////////////THIS IS WHERE THE GRADIENT IS COMPUTED////////////////////////////////
+
+    for (int sx = 0; sx < limit_sx; sx++) {       //indexes from 0 to 12 cols
+         for (int sy = 0; sy < h-1; sy++) {   //indexes from 0 to 26 rows
+
+          //  int idx      = sy * w + sx;              
+         //   int idx_r    = (sy+1) * w + sx;
+         //   int idx_c    = sy * w + (sx+1);
+            
+            int idx   = sx*h + sy;        // (row=sy, col=sx) //CORRECT
+            int idx_r = (sx + 1) * h + sy;  // pixel below     //
+            int idx_c = sx * h + (sy + 1);  // pixel right    //CORRECT
+
+            int Gx = f1[idx_c] - f1[idx];// Gx in my real axis (what I want) 
+            int Gy = f1[idx_r] - f1[idx];
+
+            //float Grad_mag = sqrtf(Gx*Gx + Gy*Gy);
+             float Grad_mag = sqrtf((float)(Gx * Gx + Gy * Gy));
+             
+            //int G_surface= f1[idx];
+            
+            Grad_tot_vertical[sy] += Grad_mag;
+            
+            //Grad_tot_surface[sx] += G_surface;
+             
+      //fprintf(stderr,"sy=%d sx=%d idx_c=%d  f1[idx]=%d f1[idx_c]=%d f1[idx_r]=%d\n",sy,sx,idx_c,f1[idx], f1[idx_c], f1[idx_r]);       
+      // fprintf(stderr,"%d ", f1[idx]);   // intensity
+       // fprintf(stderr,"| %d // ", Gx);   // gradient
+       
+            if (sy <= 7) {
+                Grad_tot_vertical_left[sy] += Grad_mag;
+                sum_left += Grad_mag;
+                }
+                
+            else if (sy <= 16) {
+                Grad_tot_vertical_middle[sy - 8] += Grad_mag;
+                sum_middle += Grad_mag;
+                }
+                
+            else{
+                Grad_tot_vertical_right[sy - 17] += Grad_mag;
+                sum_right += Grad_mag;
+                }
+
+        }
+        
+        
+        
+        
+    }
+    
+
+     
+    
+    //fprintf(stderr,"LEFT=%.2f MIDDLE=%.2f RIGHT=%.2f\n",sum_left, sum_middle, sum_right);
+    
+  //  fprintf(stderr,"\n///////////////////////////////////\n");
+    
+
 }
 
-void color_object_detector_periodic(void)
-{
-  static struct color_object_t local_filters[2];
-  pthread_mutex_lock(&mutex);
-  memcpy(local_filters, global_filters, 2*sizeof(struct color_object_t));
-  pthread_mutex_unlock(&mutex);
 
-  if(local_filters[0].updated){
-    AbiSendMsgVISUAL_DETECTION(COLOR_OBJECT_DETECTION1_ID, local_filters[0].x_c, local_filters[0].y_c,
-        0, 0, local_filters[0].color_count, 0);
-    local_filters[0].updated = false;
-  }
-  if(local_filters[1].updated){
-    AbiSendMsgVISUAL_DETECTION(COLOR_OBJECT_DETECTION2_ID, local_filters[1].x_c, local_filters[1].y_c,
-        0, 0, local_filters[1].color_count, 1);
-    local_filters[1].updated = false;
-  }
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
