@@ -7,12 +7,12 @@
 #include "state.h"
 #include "generated/flight_plan.h"
 
-// ---------------- CONFIG ----------------
+// Speed Config
 #define TURN_DEG       15.0f
 #define FORWARD_SPEED  0.6f
 #define SLOW_SPEED     0.1f
 
-// ---------------- STATE ----------------
+// Initial State
 static float forward = 0.0f;
 static float turn = 0.0f;
 
@@ -20,7 +20,7 @@ static float last_bottom_frac = 0.0f;
 static float last_upper_frac = 0.0f;
 static bool last_is_obstacle = true;
 
-// ---------------- VISION INPUT ----------------
+// Vision callback
 void orange_avoider_update_from_vision(float bottom_frac, float upper_frac, bool is_obstacle)
 {
     last_bottom_frac = bottom_frac;
@@ -30,26 +30,24 @@ void orange_avoider_update_from_vision(float bottom_frac, float upper_frac, bool
     fprintf(stderr,
             "NAV INPUT bottom=%.3f upper=%.3f obstacle=%d\n",
             bottom_frac, upper_frac, is_obstacle ? 1 : 0);
-
+    
+    // Move forward if safe, else slow down and turn clockwise
     if (!is_obstacle) {
-        // Matches Python detector outcome: safe to proceed
         forward = FORWARD_SPEED;
         turn = 0.0f;
     } else {
-        // Python detector only says "obstacle", not left/right.
-        // So use a simple fallback maneuver.
         forward = SLOW_SPEED;
         turn = TURN_DEG;
     }
 }
 
-// ---------------- MAIN NAV LOOP ----------------
 void orange_avoider_periodic(void)
 {
     if (!autopilot_in_flight()) {
         return;
     }
 
+    // move forward and rotate at specified speed
     nav.heading += RadOfDeg(turn);
     FLOAT_ANGLE_NORMALIZE(nav.heading);
 
@@ -66,7 +64,6 @@ void orange_avoider_periodic(void)
     }
 }
 
-// ---------------- INIT ----------------
 void orange_avoider_init(void)
 {
     fprintf(stderr, "[NAV] INIT OK\n");

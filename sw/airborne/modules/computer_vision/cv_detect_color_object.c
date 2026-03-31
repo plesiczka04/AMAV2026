@@ -7,38 +7,37 @@
 
 #include "modules/computer_vision/cv.h"
 
-// ---------------- CONFIG ----------------
-// Sampling stride
-#define STEP 10
+// === Config ===
+#define STEP 10 // sampling stride
+
+// Top ROI geometry
+#define ROI_WIDTH_FRAC             0.22f   
+#define ROI_HEIGHT_FRAC            0.20f   
+#define ROI_BOTTOM_MARGIN_FRAC     0.45f   
+#define ROI_CENTER_OFFSET_FRAC     0.0f  
 
 // Bottom ROI geometry
-#define ROI_WIDTH_FRAC             0.22f   // wider bottom box
-#define ROI_HEIGHT_FRAC            0.20f   // shorter bottom box
-#define ROI_BOTTOM_MARGIN_FRAC     0.45f   // lift bottom box upward from image edge
-#define ROI_CENTER_OFFSET_FRAC     0.0f    // horizontal shift if needed
+#define UPPER_ROI_WIDTH_FRAC       0.22f   
+#define UPPER_ROI_HEIGHT_FRAC      0.40f   
+#define UPPER_ROI_GAP_FRAC         0.015f 
 
-// Upper ROI geometry
-#define UPPER_ROI_WIDTH_FRAC       0.22f   // smaller width than bottom ROI
-#define UPPER_ROI_HEIGHT_FRAC      0.40f   // smaller height
-#define UPPER_ROI_GAP_FRAC         0.015f   // small gap between bottom and upper ROI
-
-// YUV thresholds, matching Python main config
+// YUV thresholds
 #define Y_MIN                     10
 #define Y_MAX                     235
 #define U_TARGET                  91.0f
 #define V_TARGET                  123.0f
 #define UV_RADIUS                 90.0f
 
-// Hue gate, matching Python  main config
+// Hue gate
 #define USE_HUE_GATE              1
 #define HUE_LOW_DEG               160.0f
 #define HUE_HIGH_DEG              220.0f
 
-// Decision thresholds, matching Python main config
+// Decision thresholds
 #define FREE_SPACE_GREEN_THRESHOLD 0.55f
 #define UPPER_GREEN_THRESHOLD      0.30f
 
-// ---------------- REQUIRED GLOBALS ----------------
+// Globals (Required for compilation because based off orange_avoider)
 uint8_t cod_lum_min1 = 0;
 uint8_t cod_lum_max1 = 0;
 uint8_t cod_cb_min1 = 0;
@@ -56,18 +55,18 @@ uint8_t cod_cr_max2 = 0;
 bool cod_draw1 = false;
 bool cod_draw2 = false;
 
-// ---------------- SHARED WITH NAV ----------------
+// Initial values
 float bottom_green_fraction = 0.0f;
 float upper_green_fraction = 0.0f;
 bool vision_is_obstacle = true;
 
-// REQUIRED by autopilot
+// required by autopilot
 float oa_color_count_frac = 0.0f;
 
-// Forward declaration (navigation module)
+// Forward declaration 
 void orange_avoider_update_from_vision(float bottom_frac, float upper_frac, bool is_obstacle);
 
-// ---------------- HELPERS ----------------
+// Helper functions
 static inline float wrap_angle_deg(float angle)
 {
     while (angle < 0.0f)   { angle += 360.0f; }
@@ -85,8 +84,6 @@ static inline bool angle_in_range(float angle, float low, float high)
 }
 
 // Read one pixel from a UYVY image buffer.
-// UYVY layout for two pixels:
-//   U0 Y0 V0 Y1
 static inline void get_uyvy_pixel(uint8_t *buf, int w, int x, int y,
                                   uint8_t *Y, uint8_t *U, uint8_t *V)
 {
@@ -103,6 +100,7 @@ static inline void get_uyvy_pixel(uint8_t *buf, int w, int x, int y,
     }
 }
 
+// Check if pixel within manually tuned green range
 static inline bool is_green_pixel(uint8_t Y, uint8_t U, uint8_t V)
 {
     if (Y < Y_MIN || Y > Y_MAX) {
@@ -130,6 +128,7 @@ static inline bool is_green_pixel(uint8_t Y, uint8_t U, uint8_t V)
     return true;
 }
 
+// overlay boxes on camera feed
 static void draw_roi_border(uint8_t *buf, int w, int h,
                             int x0, int y0, int x1, int y1,
                             uint8_t border_y)
@@ -170,7 +169,7 @@ static void draw_roi_border(uint8_t *buf, int w, int h,
     }
 }
 
-// ---------------- MAIN VISION ----------------
+
 struct image_t *color_object_detector(struct image_t *img, uint8_t cam)
 {
     (void)cam;
@@ -179,8 +178,7 @@ struct image_t *color_object_detector(struct image_t *img, uint8_t cam)
     int w = img->w;
     int h = img->h;
 
-    // -------- Bottom ROI geometry for 90 deg rotated camera --------
-    // Forward is on the RIGHT side of the image, not the bottom.
+    // Top ROI
 
     int roi_forward_depth = (int)(w * ROI_HEIGHT_FRAC);   // how far ROI extends into forward direction
     int roi_span = (int)(h * ROI_WIDTH_FRAC);             // vertical span of ROI
@@ -205,9 +203,7 @@ struct image_t *color_object_detector(struct image_t *img, uint8_t cam)
     if (y0 < 0) { y0 = 0; y1 = roi_span; }
     if (y1 > h) { y1 = h; y0 = h - roi_span; }
 
-    // -------- Upper ROI geometry for 90 deg rotated camera --------
-    // "Upper" means further LEFT in the image, because the camera is rotated.
-
+    // Bottom ROI
     int upper_depth = (int)(w * UPPER_ROI_HEIGHT_FRAC);   // horizontal depth of upper ROI
     int upper_span  = (int)(h * UPPER_ROI_WIDTH_FRAC);    // vertical span of upper ROI
     int upper_gap   = (int)(w * UPPER_ROI_GAP_FRAC);
@@ -218,11 +214,10 @@ struct image_t *color_object_detector(struct image_t *img, uint8_t cam)
     int uy0 = y_center - upper_span / 2;
     int uy1 = uy0 + upper_span;
 
-    // place upper ROI to the LEFT of the forward ROI
     int ux1 = x0 - upper_gap;
     int ux0 = ux1 - upper_depth;
 
-    // clamp upper ROI
+    // clamp ROI
     if (ux0 < 0) { ux0 = 0; }
     if (ux1 < 0) { ux1 = 0; }
     if (ux1 < ux0) { ux1 = ux0; }
@@ -230,7 +225,7 @@ struct image_t *color_object_detector(struct image_t *img, uint8_t cam)
     if (uy0 < 0) { uy0 = 0; uy1 = upper_span; }
     if (uy1 > h) { uy1 = h; uy0 = h - upper_span; }
 
-    // -------- Count green in bottom ROI --------
+    // Count green in ROI
     int bottom_total = 0;
     int bottom_green = 0;
 
@@ -246,7 +241,7 @@ struct image_t *color_object_detector(struct image_t *img, uint8_t cam)
         }
     }
 
-    // -------- Count green in upper ROI --------
+    // Count green in ROI
     int upper_total = 0;
     int upper_green = 0;
 
@@ -262,6 +257,7 @@ struct image_t *color_object_detector(struct image_t *img, uint8_t cam)
         }
     }
 
+    // Compute green fractions and free area
     bottom_green_fraction = (bottom_total > 0) ? ((float)bottom_green / (float)bottom_total) : 0.0f;
     upper_green_fraction  = (upper_total > 0) ? ((float)upper_green / (float)upper_total) : 0.0f;
 
@@ -270,12 +266,11 @@ struct image_t *color_object_detector(struct image_t *img, uint8_t cam)
 
     vision_is_obstacle = (!bottom_is_free) || upper_has_vertical_green;
 
-    // Required global
     oa_color_count_frac = bottom_green_fraction;
 
-    // Debug overlay
-    draw_roi_border(buf, w, h, x0, y0, x1, y1, 220);   // bottom ROI
-    draw_roi_border(buf, w, h, ux0, uy0, ux1, uy1, 140); // upper ROI
+    // Draw boxes
+    draw_roi_border(buf, w, h, x0, y0, x1, y1, 220);   
+    draw_roi_border(buf, w, h, ux0, uy0, ux1, uy1, 140);
 
     // Send to navigation
     orange_avoider_update_from_vision(bottom_green_fraction,
@@ -291,7 +286,6 @@ struct image_t *color_object_detector(struct image_t *img, uint8_t cam)
     return img;
 }
 
-// ---------------- REQUIRED HOOKS ----------------
 void color_object_detector_init(void)
 {
     cv_add_to_device(&COLOR_OBJECT_DETECTOR_CAMERA1,
@@ -303,5 +297,4 @@ void color_object_detector_init(void)
 
 void color_object_detector_periodic(void)
 {
-    // nothing needed
 }
