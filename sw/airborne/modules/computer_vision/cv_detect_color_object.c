@@ -1,58 +1,44 @@
-/*
- * Copyright (C) 2019 Kirk Scheper <kirkscheper@gmail.com>
- *
- * This file is part of Paparazzi.
- *
- * Paparazzi is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2, or (at your option)
- * any later version.
- *
- * Paparazzi is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Paparazzi; see the file COPYING.  If not, write to
- * the Free Software Foundation, 59 Temple Place - Suite 330,
- * Boston, MA 02111-1307, USA.
- */
-
-/**
- * @file modules/computer_vision/cv_detect_object.h
- * Assumes the object consists of a continuous color and checks
- * if you are over the defined object or not
- */
-
-// Own header
-#include "modules/computer_vision/cv_detect_color_object.h"
-#include "modules/computer_vision/cv.h"
-#include "modules/core/abi.h"
-#include "std.h"
-
+#include <stdlib.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 #include <math.h>
-#include "pthread.h"
 
-#define PRINT(string,...) fprintf(stderr, "[object_detector->%s()] " string,__FUNCTION__ , ##__VA_ARGS__)
-#if OBJECT_DETECTOR_VERBOSE
-#define VERBOSE_PRINT PRINT
-#else
-#define VERBOSE_PRINT(...)
-#endif
+#include "modules/computer_vision/cv.h"
 
-static pthread_mutex_t mutex;
+// ---------------- CONFIG ----------------
+// Sampling stride
+#define STEP 10
 
-#ifndef COLOR_OBJECT_DETECTOR_FPS1
-#define COLOR_OBJECT_DETECTOR_FPS1 0 ///< Default FPS (zero means run at camera fps)
-#endif
-#ifndef COLOR_OBJECT_DETECTOR_FPS2
-#define COLOR_OBJECT_DETECTOR_FPS2 0 ///< Default FPS (zero means run at camera fps)
-#endif
+// Bottom ROI geometry
+#define ROI_WIDTH_FRAC             0.22f   // wider bottom box
+#define ROI_HEIGHT_FRAC            0.20f   // shorter bottom box
+#define ROI_BOTTOM_MARGIN_FRAC     0.45f   // lift bottom box upward from image edge
+#define ROI_CENTER_OFFSET_FRAC     0.0f    // horizontal shift if needed
 
-// Filter Settings
+// Upper ROI geometry
+#define UPPER_ROI_WIDTH_FRAC       0.22f   // smaller width than bottom ROI
+#define UPPER_ROI_HEIGHT_FRAC      0.40f   // smaller height
+#define UPPER_ROI_GAP_FRAC         0.015f   // small gap between bottom and upper ROI
+
+// YUV thresholds, matching Python main config
+#define Y_MIN                     10
+#define Y_MAX                     235
+#define U_TARGET                  91.0f
+#define V_TARGET                  123.0f
+#define UV_RADIUS                 90.0f
+
+// Hue gate, matching Python  main config
+#define USE_HUE_GATE              1
+#define HUE_LOW_DEG               160.0f
+#define HUE_HIGH_DEG              220.0f
+
+// Decision thresholds, matching Python main config
+#define FREE_SPACE_GREEN_THRESHOLD 0.55f
+#define UPPER_GREEN_THRESHOLD      0.30f
+
+// ---------------- REQUIRED GLOBALS ----------------
 uint8_t cod_lum_min1 = 0;
 uint8_t cod_lum_max1 = 0;
 uint8_t cod_cb_min1 = 0;
@@ -70,207 +56,252 @@ uint8_t cod_cr_max2 = 0;
 bool cod_draw1 = false;
 bool cod_draw2 = false;
 
-// define global variables
-struct color_object_t {
-  int32_t x_c;
-  int32_t y_c;
-  uint32_t color_count;
-  bool updated;
-};
-struct color_object_t global_filters[2];
+// ---------------- SHARED WITH NAV ----------------
+float bottom_green_fraction = 0.0f;
+float upper_green_fraction = 0.0f;
+bool vision_is_obstacle = true;
 
-// Function
-uint32_t find_object_centroid(struct image_t *img, int32_t* p_xc, int32_t* p_yc, bool draw,
-                              uint8_t lum_min, uint8_t lum_max,
-                              uint8_t cb_min, uint8_t cb_max,
-                              uint8_t cr_min, uint8_t cr_max);
+// REQUIRED by autopilot
+float oa_color_count_frac = 0.0f;
 
-/*
- * object_detector
- * @param img - input image to process
- * @param filter - which detection filter to process
- * @return img
- */
-static struct image_t *object_detector(struct image_t *img, uint8_t filter)
+// Forward declaration (navigation module)
+void orange_avoider_update_from_vision(float bottom_frac, float upper_frac, bool is_obstacle);
+
+// ---------------- HELPERS ----------------
+static inline float wrap_angle_deg(float angle)
 {
-  uint8_t lum_min, lum_max;
-  uint8_t cb_min, cb_max;
-  uint8_t cr_min, cr_max;
-  bool draw;
-
-  switch (filter){
-    case 1:
-      lum_min = cod_lum_min1;
-      lum_max = cod_lum_max1;
-      cb_min = cod_cb_min1;
-      cb_max = cod_cb_max1;
-      cr_min = cod_cr_min1;
-      cr_max = cod_cr_max1;
-      draw = cod_draw1;
-      break;
-    case 2:
-      lum_min = cod_lum_min2;
-      lum_max = cod_lum_max2;
-      cb_min = cod_cb_min2;
-      cb_max = cod_cb_max2;
-      cr_min = cod_cr_min2;
-      cr_max = cod_cr_max2;
-      draw = cod_draw2;
-      break;
-    default:
-      return img;
-  };
-
-  int32_t x_c, y_c;
-
-  // Filter and find centroid
-  uint32_t count = find_object_centroid(img, &x_c, &y_c, draw, lum_min, lum_max, cb_min, cb_max, cr_min, cr_max);
-  VERBOSE_PRINT("Color count %d: %u, threshold %u, x_c %d, y_c %d\n", camera, object_count, count_threshold, x_c, y_c);
-  VERBOSE_PRINT("centroid %d: (%d, %d) r: %4.2f a: %4.2f\n", camera, x_c, y_c,
-        hypotf(x_c, y_c) / hypotf(img->w * 0.5, img->h * 0.5), RadOfDeg(atan2f(y_c, x_c)));
-
-  pthread_mutex_lock(&mutex);
-  global_filters[filter-1].color_count = count;
-  global_filters[filter-1].x_c = x_c;
-  global_filters[filter-1].y_c = y_c;
-  global_filters[filter-1].updated = true;
-  pthread_mutex_unlock(&mutex);
-
-  return img;
+    while (angle < 0.0f)   { angle += 360.0f; }
+    while (angle >= 360.0f){ angle -= 360.0f; }
+    return angle;
 }
 
-struct image_t *object_detector1(struct image_t *img, uint8_t camera_id);
-struct image_t *object_detector1(struct image_t *img, uint8_t camera_id __attribute__((unused)))
+static inline bool angle_in_range(float angle, float low, float high)
 {
-  return object_detector(img, 1);
+    if (low <= high) {
+        return (angle >= low && angle <= high);
+    } else {
+        return (angle >= low || angle <= high);
+    }
 }
 
-struct image_t *object_detector2(struct image_t *img, uint8_t camera_id);
-struct image_t *object_detector2(struct image_t *img, uint8_t camera_id __attribute__((unused)))
+// Read one pixel from a UYVY image buffer.
+// UYVY layout for two pixels:
+//   U0 Y0 V0 Y1
+static inline void get_uyvy_pixel(uint8_t *buf, int w, int x, int y,
+                                  uint8_t *Y, uint8_t *U, uint8_t *V)
 {
-  return object_detector(img, 2);
+    int x_even = x & ~1;
+    int base = (y * w + x_even) * 2;
+
+    *U = buf[base + 0];
+    *V = buf[base + 2];
+
+    if ((x & 1) == 0) {
+        *Y = buf[base + 1];
+    } else {
+        *Y = buf[base + 3];
+    }
 }
 
+static inline bool is_green_pixel(uint8_t Y, uint8_t U, uint8_t V)
+{
+    if (Y < Y_MIN || Y > Y_MAX) {
+        return false;
+    }
+
+    float du = ((float)U) - U_TARGET;
+    float dv = ((float)V) - V_TARGET;
+    float uv_dist = sqrtf(du * du + dv * dv);
+
+    if (uv_dist > UV_RADIUS) {
+        return false;
+    }
+
+#if USE_HUE_GATE
+    float u0 = ((float)U) - 128.0f;
+    float v0 = ((float)V) - 128.0f;
+    float hue_deg = wrap_angle_deg(atan2f(v0, u0) * 180.0f / (float)M_PI);
+
+    if (!angle_in_range(hue_deg, HUE_LOW_DEG, HUE_HIGH_DEG)) {
+        return false;
+    }
+#endif
+
+    return true;
+}
+
+static void draw_roi_border(uint8_t *buf, int w, int h,
+                            int x0, int y0, int x1, int y1,
+                            uint8_t border_y)
+{
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > w) x1 = w;
+    if (y1 > h) y1 = h;
+
+    // top + bottom
+    for (int x = x0; x < x1; x++) {
+        uint8_t Y, U, V;
+        int base_top = (y0 * w + (x & ~1)) * 2;
+        int base_bot = ((y1 - 1) * w + (x & ~1)) * 2;
+
+        if ((x & 1) == 0) {
+            buf[base_top + 1] = border_y;
+            buf[base_bot + 1] = border_y;
+        } else {
+            buf[base_top + 3] = border_y;
+            buf[base_bot + 3] = border_y;
+        }
+    }
+
+    // left + right
+    for (int y = y0; y < y1; y++) {
+        int xl = x0;
+        int xr = x1 - 1;
+
+        int base_l = (y * w + (xl & ~1)) * 2;
+        int base_r = (y * w + (xr & ~1)) * 2;
+
+        if ((xl & 1) == 0) buf[base_l + 1] = border_y;
+        else               buf[base_l + 3] = border_y;
+
+        if ((xr & 1) == 0) buf[base_r + 1] = border_y;
+        else               buf[base_r + 3] = border_y;
+    }
+}
+
+// ---------------- MAIN VISION ----------------
+struct image_t *color_object_detector(struct image_t *img, uint8_t cam)
+{
+    (void)cam;
+
+    uint8_t *buf = img->buf;
+    int w = img->w;
+    int h = img->h;
+
+    // -------- Bottom ROI geometry for 90 deg rotated camera --------
+    // Forward is on the RIGHT side of the image, not the bottom.
+
+    int roi_forward_depth = (int)(w * ROI_HEIGHT_FRAC);   // how far ROI extends into forward direction
+    int roi_span = (int)(h * ROI_WIDTH_FRAC);             // vertical span of ROI
+    int side_margin = (int)(w * ROI_BOTTOM_MARGIN_FRAC);  // margin from right image edge
+    int center_offset = (int)(h * ROI_CENTER_OFFSET_FRAC);
+
+    if (roi_forward_depth < 1) roi_forward_depth = 1;
+    if (roi_span < 1) roi_span = 1;
+
+    // vertically centered
+    int y_center = (h / 2) + center_offset;
+    int y0 = y_center - roi_span / 2;
+    int y1 = y0 + roi_span;
+
+    // forward ROI sits near the right edge
+    int x0 = side_margin;
+    int x1 = x0 + roi_forward_depth;
+
+    // clamp bottom/forward ROI
+    if (x0 < 0) { x0 = 0; }
+    if (x1 > w) { x1 = w; }
+    if (y0 < 0) { y0 = 0; y1 = roi_span; }
+    if (y1 > h) { y1 = h; y0 = h - roi_span; }
+
+    // -------- Upper ROI geometry for 90 deg rotated camera --------
+    // "Upper" means further LEFT in the image, because the camera is rotated.
+
+    int upper_depth = (int)(w * UPPER_ROI_HEIGHT_FRAC);   // horizontal depth of upper ROI
+    int upper_span  = (int)(h * UPPER_ROI_WIDTH_FRAC);    // vertical span of upper ROI
+    int upper_gap   = (int)(w * UPPER_ROI_GAP_FRAC);
+
+    if (upper_depth < 1) upper_depth = 1;
+    if (upper_span < 1) upper_span = 1;
+
+    int uy0 = y_center - upper_span / 2;
+    int uy1 = uy0 + upper_span;
+
+    // place upper ROI to the LEFT of the forward ROI
+    int ux1 = x0 - upper_gap;
+    int ux0 = ux1 - upper_depth;
+
+    // clamp upper ROI
+    if (ux0 < 0) { ux0 = 0; }
+    if (ux1 < 0) { ux1 = 0; }
+    if (ux1 < ux0) { ux1 = ux0; }
+
+    if (uy0 < 0) { uy0 = 0; uy1 = upper_span; }
+    if (uy1 > h) { uy1 = h; uy0 = h - upper_span; }
+
+    // -------- Count green in bottom ROI --------
+    int bottom_total = 0;
+    int bottom_green = 0;
+
+    for (int y = y0; y < y1; y += STEP) {
+        for (int x = x0; x < x1; x += STEP) {
+            uint8_t Y, U, V;
+            get_uyvy_pixel(buf, w, x, y, &Y, &U, &V);
+
+            bottom_total++;
+            if (is_green_pixel(Y, U, V)) {
+                bottom_green++;
+            }
+        }
+    }
+
+    // -------- Count green in upper ROI --------
+    int upper_total = 0;
+    int upper_green = 0;
+
+    for (int y = uy0; y < uy1; y += STEP) {
+        for (int x = ux0; x < ux1; x += STEP) {
+            uint8_t Y, U, V;
+            get_uyvy_pixel(buf, w, x, y, &Y, &U, &V);
+
+            upper_total++;
+            if (is_green_pixel(Y, U, V)) {
+                upper_green++;
+            }
+        }
+    }
+
+    bottom_green_fraction = (bottom_total > 0) ? ((float)bottom_green / (float)bottom_total) : 0.0f;
+    upper_green_fraction  = (upper_total > 0) ? ((float)upper_green / (float)upper_total) : 0.0f;
+
+    bool bottom_is_free = (upper_green_fraction >= FREE_SPACE_GREEN_THRESHOLD);
+    bool upper_has_vertical_green = (bottom_green_fraction >= UPPER_GREEN_THRESHOLD);
+
+    vision_is_obstacle = (!bottom_is_free) || upper_has_vertical_green;
+
+    // Required global
+    oa_color_count_frac = bottom_green_fraction;
+
+    // Debug overlay
+    draw_roi_border(buf, w, h, x0, y0, x1, y1, 220);   // bottom ROI
+    draw_roi_border(buf, w, h, ux0, uy0, ux1, uy1, 140); // upper ROI
+
+    // Send to navigation
+    orange_avoider_update_from_vision(bottom_green_fraction,
+                                      upper_green_fraction,
+                                      vision_is_obstacle);
+
+    fprintf(stderr,
+            "VISION upper=%.3f bottom=%.3f obstacle=%d\n",
+            bottom_green_fraction,
+            upper_green_fraction,
+            vision_is_obstacle ? 1 : 0);
+
+    return img;
+}
+
+// ---------------- REQUIRED HOOKS ----------------
 void color_object_detector_init(void)
 {
-  memset(global_filters, 0, 2*sizeof(struct color_object_t));
-  pthread_mutex_init(&mutex, NULL);
-#ifdef COLOR_OBJECT_DETECTOR_CAMERA1
-#ifdef COLOR_OBJECT_DETECTOR_LUM_MIN1
-  cod_lum_min1 = COLOR_OBJECT_DETECTOR_LUM_MIN1;
-  cod_lum_max1 = COLOR_OBJECT_DETECTOR_LUM_MAX1;
-  cod_cb_min1 = COLOR_OBJECT_DETECTOR_CB_MIN1;
-  cod_cb_max1 = COLOR_OBJECT_DETECTOR_CB_MAX1;
-  cod_cr_min1 = COLOR_OBJECT_DETECTOR_CR_MIN1;
-  cod_cr_max1 = COLOR_OBJECT_DETECTOR_CR_MAX1;
-#endif
-#ifdef COLOR_OBJECT_DETECTOR_DRAW1
-  cod_draw1 = COLOR_OBJECT_DETECTOR_DRAW1;
-#endif
+    cv_add_to_device(&COLOR_OBJECT_DETECTOR_CAMERA1,
+                     color_object_detector,
+                     15, 0);
 
-  cv_add_to_device(&COLOR_OBJECT_DETECTOR_CAMERA1, object_detector1, COLOR_OBJECT_DETECTOR_FPS1, 0);
-#endif
-
-#ifdef COLOR_OBJECT_DETECTOR_CAMERA2
-#ifdef COLOR_OBJECT_DETECTOR_LUM_MIN2
-  cod_lum_min2 = COLOR_OBJECT_DETECTOR_LUM_MIN2;
-  cod_lum_max2 = COLOR_OBJECT_DETECTOR_LUM_MAX2;
-  cod_cb_min2 = COLOR_OBJECT_DETECTOR_CB_MIN2;
-  cod_cb_max2 = COLOR_OBJECT_DETECTOR_CB_MAX2;
-  cod_cr_min2 = COLOR_OBJECT_DETECTOR_CR_MIN2;
-  cod_cr_max2 = COLOR_OBJECT_DETECTOR_CR_MAX2;
-#endif
-#ifdef COLOR_OBJECT_DETECTOR_DRAW2
-  cod_draw2 = COLOR_OBJECT_DETECTOR_DRAW2;
-#endif
-
-  cv_add_to_device(&COLOR_OBJECT_DETECTOR_CAMERA2, object_detector2, COLOR_OBJECT_DETECTOR_FPS2, 1);
-#endif
-}
-
-/*
- * find_object_centroid
- *
- * Finds the centroid of pixels in an image within filter bounds.
- * Also returns the amount of pixels that satisfy these filter bounds.
- *
- * @param img - input image to process formatted as YUV422.
- * @param p_xc - x coordinate of the centroid of color object
- * @param p_yc - y coordinate of the centroid of color object
- * @param lum_min - minimum y value for the filter in YCbCr colorspace
- * @param lum_max - maximum y value for the filter in YCbCr colorspace
- * @param cb_min - minimum cb value for the filter in YCbCr colorspace
- * @param cb_max - maximum cb value for the filter in YCbCr colorspace
- * @param cr_min - minimum cr value for the filter in YCbCr colorspace
- * @param cr_max - maximum cr value for the filter in YCbCr colorspace
- * @param draw - whether or not to draw on image
- * @return number of pixels of image within the filter bounds.
- */
-uint32_t find_object_centroid(struct image_t *img, int32_t* p_xc, int32_t* p_yc, bool draw,
-                              uint8_t lum_min, uint8_t lum_max,
-                              uint8_t cb_min, uint8_t cb_max,
-                              uint8_t cr_min, uint8_t cr_max)
-{
-  uint32_t cnt = 0;
-  uint32_t tot_x = 0;
-  uint32_t tot_y = 0;
-  uint8_t *buffer = img->buf;
-
-  // Go through all the pixels
-  for (uint16_t y = 0; y < img->h; y++) {
-    for (uint16_t x = 0; x < img->w; x ++) {
-      // Check if the color is inside the specified values
-      uint8_t *yp, *up, *vp;
-      if (x % 2 == 0) {
-        // Even x
-        up = &buffer[y * 2 * img->w + 2 * x];      // U
-        yp = &buffer[y * 2 * img->w + 2 * x + 1];  // Y1
-        vp = &buffer[y * 2 * img->w + 2 * x + 2];  // V
-        //yp = &buffer[y * 2 * img->w + 2 * x + 3]; // Y2
-      } else {
-        // Uneven x
-        up = &buffer[y * 2 * img->w + 2 * x - 2];  // U
-        //yp = &buffer[y * 2 * img->w + 2 * x - 1]; // Y1
-        vp = &buffer[y * 2 * img->w + 2 * x];      // V
-        yp = &buffer[y * 2 * img->w + 2 * x + 1];  // Y2
-      }
-      if ( (*yp >= lum_min) && (*yp <= lum_max) &&
-           (*up >= cb_min ) && (*up <= cb_max ) &&
-           (*vp >= cr_min ) && (*vp <= cr_max )) {
-        cnt ++;
-        tot_x += x;
-        tot_y += y;
-        if (draw){
-          *yp = 255;  // make pixel brighter in image
-        }
-      }
-    }
-  }
-  if (cnt > 0) {
-    *p_xc = (int32_t)roundf(tot_x / ((float) cnt) - img->w * 0.5f);
-    *p_yc = (int32_t)roundf(img->h * 0.5f - tot_y / ((float) cnt));
-  } else {
-    *p_xc = 0;
-    *p_yc = 0;
-  }
-  return cnt;
+    fprintf(stderr, "[VISION] INIT OK\n");
 }
 
 void color_object_detector_periodic(void)
 {
-  static struct color_object_t local_filters[2];
-  pthread_mutex_lock(&mutex);
-  memcpy(local_filters, global_filters, 2*sizeof(struct color_object_t));
-  pthread_mutex_unlock(&mutex);
-
-  if(local_filters[0].updated){
-    AbiSendMsgVISUAL_DETECTION(COLOR_OBJECT_DETECTION1_ID, local_filters[0].x_c, local_filters[0].y_c,
-        0, 0, local_filters[0].color_count, 0);
-    local_filters[0].updated = false;
-  }
-  if(local_filters[1].updated){
-    AbiSendMsgVISUAL_DETECTION(COLOR_OBJECT_DETECTION2_ID, local_filters[1].x_c, local_filters[1].y_c,
-        0, 0, local_filters[1].color_count, 1);
-    local_filters[1].updated = false;
-  }
+    // nothing needed
 }
