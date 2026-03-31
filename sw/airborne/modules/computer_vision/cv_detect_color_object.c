@@ -1,300 +1,228 @@
 #include <stdlib.h>
 #include <stdio.h>
-#include <stdint.h>
-#include <stdbool.h>
 #include <string.h>
 #include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 #include "modules/computer_vision/cv.h"
+#include "modules/core/abi.h"
+#include "state.h"
 
-// === Config ===
-#define STEP 10 // sampling stride
 
-// Top ROI geometry
-#define ROI_WIDTH_FRAC             0.22f   
-#define ROI_HEIGHT_FRAC            0.20f   
-#define ROI_BOTTOM_MARGIN_FRAC     0.45f   
-#define ROI_CENTER_OFFSET_FRAC     0.0f  
+int cod_lum_min1=0,cod_lum_max1=255,cod_cb_min1=0,cod_cb_max1=255,cod_cr_min1=0,cod_cr_max1=255,cod_draw1=1;
+int cod_lum_min2=0,cod_lum_max2=255,cod_cb_min2=0,cod_cb_max2=255,cod_cr_min2=0,cod_cr_max2=255,cod_draw2=0;
+float oa_color_count_frac=0.f;
 
-// Bottom ROI geometry
-#define UPPER_ROI_WIDTH_FRAC       0.22f   
-#define UPPER_ROI_HEIGHT_FRAC      0.40f   
-#define UPPER_ROI_GAP_FRAC         0.015f 
+// Config 
+#define DS_W 96  // width of downscaled image
+#define DS_H 24  // height of downscaled image
+#define WIN 5
+#define ITER 6
+#define MAX_CORNERS 1000
+#define CORNER_THR 40.0f
+#define FLOW_SCALE_VIS 20.0f
+#define EXPANSION_SCALE 500.0f
+#define FOCAL_LENGTH_PX 25.0f
 
-// YUV thresholds
-#define Y_MIN                     10
-#define Y_MAX                     235
-#define U_TARGET                  91.0f
-#define V_TARGET                  123.0f
-#define UV_RADIUS                 90.0f
+static uint8_t frame_prev[DS_W*DS_H];
+static uint8_t frame_curr[DS_W*DS_H];
+static float flow_u[DS_H][DS_W];
+static float flow_v[DS_H][DS_W];
+static bool initialized=false;
 
-// Hue gate
-#define USE_HUE_GATE              1
-#define HUE_LOW_DEG               160.0f
-#define HUE_HIGH_DEG              220.0f
+typedef struct{ float x,y; } corner_t;
+static corner_t corners[MAX_CORNERS];
+static int corner_count=0;
 
-// Decision thresholds
-#define FREE_SPACE_GREEN_THRESHOLD 0.55f
-#define UPPER_GREEN_THRESHOLD      0.30f
-
-// Globals (Required for compilation because based off orange_avoider)
-uint8_t cod_lum_min1 = 0;
-uint8_t cod_lum_max1 = 0;
-uint8_t cod_cb_min1 = 0;
-uint8_t cod_cb_max1 = 0;
-uint8_t cod_cr_min1 = 0;
-uint8_t cod_cr_max1 = 0;
-
-uint8_t cod_lum_min2 = 0;
-uint8_t cod_lum_max2 = 0;
-uint8_t cod_cb_min2 = 0;
-uint8_t cod_cb_max2 = 0;
-uint8_t cod_cr_min2 = 0;
-uint8_t cod_cr_max2 = 0;
-
-bool cod_draw1 = false;
-bool cod_draw2 = false;
-
-// Initial values
-float bottom_green_fraction = 0.0f;
-float upper_green_fraction = 0.0f;
-bool vision_is_obstacle = true;
-
-// required by autopilot
-float oa_color_count_frac = 0.0f;
-
-// Forward declaration 
-void orange_avoider_update_from_vision(float bottom_frac, float upper_frac, bool is_obstacle);
-
-// Helper functions
-static inline float wrap_angle_deg(float angle)
+// Downscaling
+static void extract_downscale(struct image_t *img,uint8_t*out)
 {
-    while (angle < 0.0f)   { angle += 360.0f; }
-    while (angle >= 360.0f){ angle -= 360.0f; }
-    return angle;
+  uint8_t* buf = (uint8_t*)img->buf;
+  for(int y=0;y<DS_H;y++) {
+    int iy = (y*(img->h-1))/(DS_H-1);
+    for(int x=0;x<DS_W;x++) {
+      int ix = (x*(img->w-1))/(DS_W-1);
+      int idx = (iy*img->w + ix)*2;
+      out[y*DS_W + x] = buf[idx]; // luminance only
+    }
+  }
 }
 
-static inline bool angle_in_range(float angle, float low, float high)
+// Corner Detecton
+static void detect_corners()
 {
-    if (low <= high) {
-        return (angle >= low && angle <= high);
-    } else {
-        return (angle >= low || angle <= high);
+  corner_count=0;
+  for(int y=WIN; y<DS_H-WIN; y++){
+    for(int x=WIN; x<DS_W-WIN; x++){
+      if(x > DS_W/2-3 && x < DS_W/2+3) continue;
+      float dx = frame_curr[y*DS_W + x+1] - frame_curr[y*DS_W + x-1];
+      float dy = frame_curr[(y+1)*DS_W + x] - frame_curr[(y-1)*DS_W + x];
+      float score = dx*dx + dy*dy;
+      if(score > CORNER_THR && corner_count < MAX_CORNERS){
+        corners[corner_count].x = x;
+        corners[corner_count].y = y;
+        corner_count++;
+      }
     }
+  }
 }
 
-// Read one pixel from a UYVY image buffer.
-static inline void get_uyvy_pixel(uint8_t *buf, int w, int x, int y,
-                                  uint8_t *Y, uint8_t *U, uint8_t *V)
+// Lucas Canade Optical FLow
+static void compute_lk()
 {
-    int x_even = x & ~1;
-    int base = (y * w + x_even) * 2;
-
-    *U = buf[base + 0];
-    *V = buf[base + 2];
-
-    if ((x & 1) == 0) {
-        *Y = buf[base + 1];
-    } else {
-        *Y = buf[base + 3];
-    }
-}
-
-// Check if pixel within manually tuned green range
-static inline bool is_green_pixel(uint8_t Y, uint8_t U, uint8_t V)
-{
-    if (Y < Y_MIN || Y > Y_MAX) {
-        return false;
-    }
-
-    float du = ((float)U) - U_TARGET;
-    float dv = ((float)V) - V_TARGET;
-    float uv_dist = sqrtf(du * du + dv * dv);
-
-    if (uv_dist > UV_RADIUS) {
-        return false;
-    }
-
-#if USE_HUE_GATE
-    float u0 = ((float)U) - 128.0f;
-    float v0 = ((float)V) - 128.0f;
-    float hue_deg = wrap_angle_deg(atan2f(v0, u0) * 180.0f / (float)M_PI);
-
-    if (!angle_in_range(hue_deg, HUE_LOW_DEG, HUE_HIGH_DEG)) {
-        return false;
-    }
-#endif
-
-    return true;
-}
-
-// overlay boxes on camera feed
-static void draw_roi_border(uint8_t *buf, int w, int h,
-                            int x0, int y0, int x1, int y1,
-                            uint8_t border_y)
-{
-    if (x0 < 0) x0 = 0;
-    if (y0 < 0) y0 = 0;
-    if (x1 > w) x1 = w;
-    if (y1 > h) y1 = h;
-
-    // top + bottom
-    for (int x = x0; x < x1; x++) {
-        uint8_t Y, U, V;
-        int base_top = (y0 * w + (x & ~1)) * 2;
-        int base_bot = ((y1 - 1) * w + (x & ~1)) * 2;
-
-        if ((x & 1) == 0) {
-            buf[base_top + 1] = border_y;
-            buf[base_bot + 1] = border_y;
-        } else {
-            buf[base_top + 3] = border_y;
-            buf[base_bot + 3] = border_y;
+  memset(flow_u,0,sizeof(flow_u));
+  memset(flow_v,0,sizeof(flow_v));
+  for(int n=0; n<corner_count; n++){
+    int ix=(int)corners[n].x; int iy=(int)corners[n].y;
+    float u=0,v=0;
+    for(int iter=0; iter<ITER; iter++){
+      float G11=0,G12=0,G22=0,b1=0,b2=0;
+      for(int wy=-WIN; wy<=WIN; wy++){
+        for(int wx=-WIN; wx<=WIN; wx++){
+          int x=ix+wx; int y=iy+wy;
+          float Ix = frame_curr[y*DS_W+x+1] - frame_curr[y*DS_W+x-1];
+          float Iy = frame_curr[(y+1)*DS_W+x] - frame_curr[(y-1)*DS_W+x];
+          float It = frame_curr[y*DS_W+x] - frame_prev[y*DS_W+x];
+          G11 += Ix*Ix; G12 += Ix*Iy; G22 += Iy*Iy; b1 += Ix*It; b2 += Iy*It;
         }
+      }
+      float det = G11*G22 - G12*G12;
+      if(fabs(det)<0.01f) break;
+      u += (G12*b2 - G22*b1)/det;
+      v += (G12*b1 - G11*b2)/det;
     }
-
-    // left + right
-    for (int y = y0; y < y1; y++) {
-        int xl = x0;
-        int xr = x1 - 1;
-
-        int base_l = (y * w + (xl & ~1)) * 2;
-        int base_r = (y * w + (xr & ~1)) * 2;
-
-        if ((xl & 1) == 0) buf[base_l + 1] = border_y;
-        else               buf[base_l + 3] = border_y;
-
-        if ((xr & 1) == 0) buf[base_r + 1] = border_y;
-        else               buf[base_r + 3] = border_y;
-    }
+    flow_u[iy][ix] = u; flow_v[iy][ix] = v;
+  }
 }
 
-
-struct image_t *color_object_detector(struct image_t *img, uint8_t cam)
+static void compute_expansion(int32_t* left, int32_t* right)
 {
-    (void)cam;
+  float lsum=0, rsum=0; 
+  int lc=0, rc=0;
+  float cx = DS_W/2.0f;
+  float cy = DS_H/2.0f;
 
-    uint8_t *buf = img->buf;
-    int w = img->w;
-    int h = img->h;
+  float yaw_rate = stateGetBodyRates_f()->r;
+  float u_rot = -FOCAL_LENGTH_PX * yaw_rate;
 
-    // Top ROI
+  for(int n=0; n<corner_count; n++){
+    int x = (int)corners[n].x;
+    int y = (int)corners[n].y;
+    float dx = x - cx;
+    float dy = y - cy;
 
-    int roi_forward_depth = (int)(w * ROI_HEIGHT_FRAC);   // how far ROI extends into forward direction
-    int roi_span = (int)(h * ROI_WIDTH_FRAC);             // vertical span of ROI
-    int side_margin = (int)(w * ROI_BOTTOM_MARGIN_FRAC);  // margin from right image edge
-    int center_offset = (int)(h * ROI_CENTER_OFFSET_FRAC);
+    float u_corr = flow_u[y][x] - u_rot;
+    float v_corr = flow_v[y][x];
 
-    if (roi_forward_depth < 1) roi_forward_depth = 1;
-    if (roi_span < 1) roi_span = 1;
+    float pitch_rate = stateGetBodyRates_f()->p;
+    float roll_rate  = stateGetBodyRates_f()->q;
 
-    // vertically centered
-    int y_center = (h / 2) + center_offset;
-    int y0 = y_center - roi_span / 2;
-    int y1 = y0 + roi_span;
+    v_corr -= FOCAL_LENGTH_PX * pitch_rate;
+    u_corr -= FOCAL_LENGTH_PX * roll_rate;
 
-    // forward ROI sits near the right edge
-    int x0 = side_margin;
-    int x1 = x0 + roi_forward_depth;
+    float exp = u_corr*dx + v_corr*dy;
 
-    // clamp bottom/forward ROI
-    if (x0 < 0) { x0 = 0; }
-    if (x1 > w) { x1 = w; }
-    if (y0 < 0) { y0 = 0; y1 = roi_span; }
-    if (y1 > h) { y1 = h; y0 = h - roi_span; }
-
-    // Bottom ROI
-    int upper_depth = (int)(w * UPPER_ROI_HEIGHT_FRAC);   // horizontal depth of upper ROI
-    int upper_span  = (int)(h * UPPER_ROI_WIDTH_FRAC);    // vertical span of upper ROI
-    int upper_gap   = (int)(w * UPPER_ROI_GAP_FRAC);
-
-    if (upper_depth < 1) upper_depth = 1;
-    if (upper_span < 1) upper_span = 1;
-
-    int uy0 = y_center - upper_span / 2;
-    int uy1 = uy0 + upper_span;
-
-    int ux1 = x0 - upper_gap;
-    int ux0 = ux1 - upper_depth;
-
-    // clamp ROI
-    if (ux0 < 0) { ux0 = 0; }
-    if (ux1 < 0) { ux1 = 0; }
-    if (ux1 < ux0) { ux1 = ux0; }
-
-    if (uy0 < 0) { uy0 = 0; uy1 = upper_span; }
-    if (uy1 > h) { uy1 = h; uy0 = h - upper_span; }
-
-    // Count green in ROI
-    int bottom_total = 0;
-    int bottom_green = 0;
-
-    for (int y = y0; y < y1; y += STEP) {
-        for (int x = x0; x < x1; x += STEP) {
-            uint8_t Y, U, V;
-            get_uyvy_pixel(buf, w, x, y, &Y, &U, &V);
-
-            bottom_total++;
-            if (is_green_pixel(Y, U, V)) {
-                bottom_green++;
-            }
-        }
+    if(exp > 0.25f){
+      if(x < cx){ lsum += exp; lc++; }
+      else { rsum += exp; rc++; }
     }
+  }
 
-    // Count green in ROI
-    int upper_total = 0;
-    int upper_green = 0;
+  *left = lc > 8 ? (int32_t)((lsum/lc)*EXPANSION_SCALE) : 0;
+  *right = rc > 8 ? (int32_t)((rsum/rc)*EXPANSION_SCALE) : 0;
+}
 
-    for (int y = uy0; y < uy1; y += STEP) {
-        for (int x = ux0; x < ux1; x += STEP) {
-            uint8_t Y, U, V;
-            get_uyvy_pixel(buf, w, x, y, &Y, &U, &V);
+// Visualization
+static void draw_debug_pip(struct image_t *img, int best_slice)
+{
+  uint8_t* buf = (uint8_t*)img->buf;
 
-            upper_total++;
-            if (is_green_pixel(Y, U, V)) {
-                upper_green++;
-            }
-        }
+  int num_slices = 10;
+  int slice_w_ds = DS_W / num_slices;
+
+  int thickness = 3;  
+  int step = 1;       
+
+  for(int s = 0; s < num_slices; s++) {
+
+    int x_ds = s * slice_w_ds + slice_w_ds / 2;
+
+    for(int y_ds = 0; y_ds < DS_H; y_ds += step) {
+
+      int x = img->w - (y_ds * img->w) / DS_H;
+      int y = (x_ds * img->h) / DS_W;
+
+      for(int t = -thickness; t <= thickness; t++) {
+
+        int xt = x + t;
+
+        if(xt < 0 || xt >= img->w || y < 0 || y >= img->h) continue;
+
+        int idx = (y * img->w + xt) * 2;
+
+        buf[idx]     = 255;
+        buf[idx + 1] = 128;
+      }
     }
+  }
 
-    // Compute green fractions and free area
-    bottom_green_fraction = (bottom_total > 0) ? ((float)bottom_green / (float)bottom_total) : 0.0f;
-    upper_green_fraction  = (upper_total > 0) ? ((float)upper_green / (float)upper_total) : 0.0f;
+  // Draw best slice
+  int bx_ds = best_slice * slice_w_ds + slice_w_ds / 2;
 
-    bool bottom_is_free = (upper_green_fraction >= FREE_SPACE_GREEN_THRESHOLD);
-    bool upper_has_vertical_green = (bottom_green_fraction >= UPPER_GREEN_THRESHOLD);
+  for(int y_ds = 0; y_ds < DS_H; y_ds += step) {
 
-    vision_is_obstacle = (!bottom_is_free) || upper_has_vertical_green;
+    int x = (y_ds * img->w) / DS_H;
+    int y = img->h - (bx_ds * img->h) / DS_W;
 
-    oa_color_count_frac = bottom_green_fraction;
+    for(int t = -thickness-1; t <= thickness+1; t++) {
 
-    // Draw boxes
-    draw_roi_border(buf, w, h, x0, y0, x1, y1, 220);   
-    draw_roi_border(buf, w, h, ux0, uy0, ux1, uy1, 140);
+      int xt = x + t;
 
-    // Send to navigation
-    orange_avoider_update_from_vision(bottom_green_fraction,
-                                      upper_green_fraction,
-                                      vision_is_obstacle);
+      if(xt < 0 || xt >= img->w || y < 0 || y >= img->h) continue;
 
-    fprintf(stderr,
-            "VISION upper=%.3f bottom=%.3f obstacle=%d\n",
-            bottom_green_fraction,
-            upper_green_fraction,
-            vision_is_obstacle ? 1 : 0);
+      int idx = (y * img->w + xt) * 2;
 
+      buf[idx]     = 0;
+      buf[idx + 1] = 255;
+    }
+  }
+}
+
+struct image_t* color_object_detector(struct image_t* img, uint8_t cam)
+{
+  if(!initialized){
+    extract_downscale(img,frame_prev);
+    initialized = true;
     return img;
+  }
+
+  extract_downscale(img,frame_curr);
+  detect_corners();
+  compute_lk();
+
+  int32_t l=0, r=0;
+  compute_expansion(&l,&r);
+
+  // Determine best slice for visualization
+  int num_slices = 10;
+  int best_slice = num_slices / 2; // center default
+
+  if (l > r + 50) {
+    best_slice = 1; // go left
+  } else if (r > l + 50) {
+  best_slice = num_slices - 2; // go right
+}
+  draw_debug_pip(img,best_slice);
+
+  AbiSendMsgVISUAL_DETECTION(ABI_BROADCAST,0,0,0,0,r,(int16_t)l);
+  memcpy(frame_prev,frame_curr,DS_W*DS_H);
+
+  return img;
 }
 
-void color_object_detector_init(void)
-{
-    cv_add_to_device(&COLOR_OBJECT_DETECTOR_CAMERA1,
-                     color_object_detector,
-                     15, 0);
-
-    fprintf(stderr, "[VISION] INIT OK\n");
+void color_object_detector_init(void){
+  cv_add_to_device(&COLOR_OBJECT_DETECTOR_CAMERA1,color_object_detector,15,0);
 }
 
-void color_object_detector_periodic(void)
-{
-}
+void color_object_detector_periodic(void){}
